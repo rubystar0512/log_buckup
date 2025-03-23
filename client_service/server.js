@@ -1,7 +1,8 @@
 const axios = require("axios");
 const dotenv = require("dotenv");
-const log = require("./utils/logger");
 const fs = require("fs");
+
+const log = require("./utils/logger");
 
 dotenv.config();
 

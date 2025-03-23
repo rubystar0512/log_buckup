@@ -1,8 +1,8 @@
 const { DataTypes } = require("sequelize");
 const sequelize = require("./index");
 
-const Certificate = sequelize.define(
-  "Certificate",
+const Sti_Error = sequelize.define(
+  "sti_error",
   {
     uuid: {
       type: DataTypes.UUID,
@@ -91,7 +91,7 @@ const Certificate = sequelize.define(
     },
   },
   {
-    tableName: "certificates",
+    tableName: "sti_error",
     timestamps: true,
     indexes: [
       {
@@ -104,4 +104,4 @@ const Certificate = sequelize.define(
   }
 );
 
-module.exports = Certificate;
+module.exports = Sti_Error;
