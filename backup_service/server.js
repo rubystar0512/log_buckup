@@ -10,8 +10,17 @@ const fs = require("fs").promises;
 const execPromise = util.promisify(exec);
 require("dotenv").config();
 const bodyParser = require("body-parser");
+const cors = require("cors");
+const { Sequelize } = require("sequelize");
 
 const app = express();
+app.use(
+  cors({
+    origin: process.env.CORS_ORIGIN || "*",
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
 app.use(bodyParser.json({ limit: "50mb", extended: true }));
 
 const transporter = nodemailer.createTransport({
@@ -27,42 +36,152 @@ const isLogFromToday = (date) => {
   return moment(date).isSame(moment(), "day");
 };
 
-async function sendEmail(logData) {
-  if (process.env.ENABLE_AUTO_EMAIL !== "true") return;
+// Add new sequelize connection for stilog database
+const stilogDB = new Sequelize(process.env.STILOG_DATABASE_URL, {
+  logging: false,
+  dialectOptions: {
+    // Remove SSL configuration if the database doesn't support SSL
+  },
+});
 
-  const mailOptions = {
-    from: process.env.FROM_EMAIL,
-    to: process.env.CC_EMAIL,
-    subject: "New Certificate Alert",
-    text: `New certificate detected:\nIdentity: ${logData.identity}\nExpiry: ${logData.not_after}`,
-  };
-
+async function sendEmail(logData, result) {
   try {
-    await transporter.sendMail(mailOptions);
-    logger("info", "Email", "Alert email sent successfully");
+    let subject = "";
+    let emailContent = "";
+    const company = result.Origination;
+
+    let recipient = null;
+    try {
+      [recipient] = await stilogDB.query(
+        "SELECT DISTINCT email, first_name FROM sp WHERE status = :status AND company = :company AND email IS NOT NULL LIMIT 1",
+        {
+          replacements: { status: "Active", company: company },
+          type: stilogDB.QueryTypes.SELECT,
+        }
+      );
+    } catch (error) {
+      logger(
+        "error",
+        "Database",
+        `Failed to query stilog database: ${error.message}`
+      );
+      return;
+    }
+
+    if (!recipient) {
+      return;
+    }
+
+    if (!logData.cert_url_found) {
+      subject = `Notification: Certificate Not Downloaded for OCN ${company}`;
+      emailContent = `Certificate URL could not be accessed for OCN ${company}`;
+    } else if (result.Identity_error.includes("Signature validation failed")) {
+      subject = `Notification: Invalid Identity SHAKEN for OCN ${company}`;
+
+      const personalizedContent = `Hi ${recipient.first_name || ""},
+
+        This is a courtesy email to inform you that we have detected your OCN ${company} is generating an invalid identity header. The identity header in question is:
+
+        ${logData.identity}
+
+        Error:
+        🚨 ${result.Identity_error}
+
+        As Peeringhub is a certified STIR/SHAKEN CA, we can generate a valid certificate for you to resolve this issue.
+
+        Pricing:
+        $75/month
+
+        $450/year (Save $150)
+
+        During your subscription, you can generate unlimited certificates and enjoy our free Certificate Repository service to host your certificate. You can also use Peeringhub's auto-renewal feature to prevent the risk of using an expired certificate on your calls.
+
+        Getting started is simple! Just register at www.peeringhub.io, and you'll be able to use our automatic tool to generate your certificate in just a few clicks.
+
+        If you need assistance, feel free to contact us at akwong@peeringhub.io, and we'll be happy to help!
+
+        Best regards,
+        Peeringhub Team`;
+
+      const mailOptions = {
+        from: process.env.FROM_EMAIL,
+        to: "rubystar0512@gmail.com",
+        subject: subject,
+        text: personalizedContent,
+      };
+
+      try {
+        await transporter.sendMail(mailOptions);
+        logger(
+          "info",
+          "Email",
+          `Alert email sent successfully to ${recipient.email}`
+        );
+      } catch (error) {
+        logger(
+          "error",
+          "Email",
+          `Failed to send email to ${recipient.email}: ${error.message}`
+        );
+      }
+
+      if (process.env.ENABLE_AUTO_EMAIL === "true") {
+        await EmailPreference.create({
+          uuid: crypto.randomUUID(),
+          email: recipient?.email,
+          subject: `Certificate Alert for ${company}`,
+          content: `Certificate alert for company ${company}: ${
+            data.Identity_error || "No specific error"
+          }`,
+          notification_type: "certificate_alert",
+          certificate_uuid: logData.uuid,
+        });
+        logger("info", "Database", "Insert email event to Postgres");
+      }
+      return;
+    } else if (isLogFromToday(result.not_after)) {
+      subject = `Notification: Expired Certificate for OCN ${company}`;
+      emailContent = `Certificate has expired for OCN ${company}\nExpiry date: ${result.not_after}`;
+    } else {
+      subject = `Notification: Invalid Certificate for OCN ${company}`;
+      emailContent = `Invalid certificate detected for OCN ${company}\nError: ${result.Identity_error}`;
+    }
+
+    // For non-personalized emails, send as group
+    if (emailContent) {
+      const mailOptions = {
+        from: process.env.FROM_EMAIL,
+        to: "rubystar0512@gmail.com",
+        subject: subject,
+        text: emailContent,
+      };
+
+      try {
+        await transporter.sendMail(mailOptions);
+        logger("info", "Email", "Alert email sent successfully");
+      } catch (error) {
+        logger("error", "Email", `Failed to send email: ${error.message}`);
+      }
+    }
   } catch (error) {
     logger("error", "Email", `Failed to send email: ${error.message}`);
   }
 }
 
-async function notifyMattermost(logData) {
+async function notifyMattermost(logData, result) {
   try {
     await axios.post(process.env.MATTERMOST_URL, {
-      text: `New Certificate Alert:\nIdentity: ${logData.identity}\nExpiry: ${logData.not_after}`,
+      text: `New Certificate Alert:\nIdentity: ${logData.identity}\nExpiry: ${result.not_after}`,
     });
-    logger("info", "Mattermost", "Alert sent to Mattermost");
-  } catch (error) {
-    logger(
-      "error",
-      "Mattermost",
-      `Failed to send Mattermost notification: ${error.message}`
-    );
-  }
+    logger("info", "Mattermost", "Push  Notification Email to Mattermost");
+  } catch (error) {}
 }
 
 const Sti_Error = require("./models/Sti_Error");
 const EmailPreference = require("./models/EmailPreference");
+const OptOutCompany = require("./models/OptOutCompany");
 const sequelize = require("./models/index");
+const { Op } = require("sequelize");
 
 async function processCertificateData(logData) {
   try {
@@ -84,87 +203,84 @@ async function processCertificateData(logData) {
 
         clear_text_cert = await parseCertificate(certificate);
 
-        const certFields = extractCertificateFields(clear_text_cert);
-
-        console.log(certFields);
-
-        // // const result = await Sti_Error.create({
-        // //   uuid: logData.uuid,
-        // //   identity_header: logData.identity,
-        // //   err1: logData.err1,
-        // //   err2: logData.err2,
-        // //   err3: logData.err3,
-        // //   cert_url: cert_url,
-        // //   cert_url_found: cert_url_found,
-        // //   certificate: certificate,
-        // //   clear_text_cert: clear_text_cert,
-        // //   signature: certFields.signature,
-        // //   ani: certFields.ani,
-        // //   dnis: certFields.dnis,
-        // //   CA: certFields.CA,
-        // //   not_after: certFields.not_after,
-        // //   not_before: certFields.not_before,
-        // //   OCN: certFields.OCN,
-        // //   Origination: certFields.Origination,
-        // //   Country: certFields.Country,
-        // //   Identity_error: certFields.Identity_error,
-        // //   is_repeated: false,
-        // // });
-
-        // // const isRepeated = await checkIfRepeated(cert_url, logData.uuid);
-        // // if (isRepeated) {
-        // //   await result.update({ is_repeated: true });
-        // // }
-
-        // // if (isLogFromToday(certFields.not_after) && !isRepeated) {
-        // //   await sendEmail(logData);
-        // //   await notifyMattermost(logData);
-
-        // //   if (process.env.ENABLE_AUTO_EMAIL === "true") {
-        // //     await EmailPreference.create({
-        // //       email: process.env.CC_EMAIL,
-        // //       notification_type: "certificate_alert",
-        // //       certificate_uuid: logData.uuid,
-        // //     });
-        // //     logger("info", "Database", "Insert email event to Postgres");
-        // //   }
-        // // }
-
-        // return result;
-      } catch (error) {
-        logger(
-          "error",
-          "Certificate",
-          `Failed to process certificate: ${error.message}`
+        const certFields = await extractCertificateFields(
+          clear_text_cert,
+          logData.identity
         );
-        // return await Sti_Error.create({
-        //   uuid: logData.uuid,
-        //   identity_header: logData.identity,
-        //   err1: logData.err1,
-        //   err2: logData.err2,
-        //   err3: logData.err3,
-        //   cert_url: cert_url,
-        //   cert_url_found: false,
-        //   Identity_error: error.message,
-        // });
+        const data = {
+          uuid: logData.uuid,
+          identity_header: logData.identity,
+          err1: logData.err1,
+          err2: logData.err2,
+          err3: logData.err3,
+          cert_url: cert_url,
+          cert_url_found: cert_url_found,
+          certificate: certificate,
+          clear_text_cert: clear_text_cert,
+          signature: certFields.signature,
+          ani: certFields.ani,
+          dnis: certFields.dnis,
+          CA: certFields.CA,
+          not_after: certFields.not_after,
+          not_before: certFields.not_before,
+          OCN: certFields.OCN,
+          Origination: certFields.Origination,
+          Country: certFields.Country,
+          Identity_error: certFields.Identity_error,
+          is_repeated: false,
+        };
+        const isRepeated = await checkIfRepeated(cert_url);
+        if (isRepeated) {
+          data.is_repeated = true;
+        }
+
+        if (!isRepeated) {
+          const company = certFields.Origination;
+          if (company) {
+            const hasOptedOut = await OptOutCompany.findOne({
+              where: { company },
+            });
+
+            if (!hasOptedOut) {
+              await sendEmail(logData, data);
+              await notifyMattermost(logData, data);
+            } else {
+              logger(
+                "info",
+                "Opt-out",
+                `Skipping notifications for opted-out company: ${company}`
+              );
+            }
+          }
+        }
+
+        const result = await Sti_Error.create(data);
+
+        return result;
+      } catch (error) {
+        return await Sti_Error.create({
+          uuid: logData.uuid,
+          identity_header: logData.identity,
+          err1: logData.err1,
+          err2: logData.err2,
+          err3: logData.err3,
+          cert_url: cert_url,
+          cert_url_found: false,
+          Identity_error: error.message,
+        });
       }
     } else {
-      //   return await Sti_Error.create({
-      //     uuid: logData.uuid,
-      //     identity_header: logData.identity,
-      //     err1: logData.err1,
-      //     err2: logData.err2,
-      //     err3: logData.err3,
-      //     cert_url_found: false,
-      //     Identity_error: "No certificate URL found in identity header",
-      //   });
+      return await Sti_Error.create({
+        uuid: logData.uuid,
+        identity_header: logData.identity,
+        err1: logData.err1,
+        err2: logData.err2,
+        err3: logData.err3,
+        cert_url_found: false,
+        Identity_error: "No certificate URL found in identity header",
+      });
     }
   } catch (error) {
-    logger(
-      "error",
-      "Processing",
-      `Error processing certificate data: ${error.message}`
-    );
     throw error;
   }
 }
@@ -176,22 +292,17 @@ function extractCertUrl(identityHeader) {
 
 async function parseCertificate(certData) {
   try {
-    const tempFile = `.s/tmp/cert_${Date.now()}.pem`;
-
-    await fs.writeFile(tempFile, certData);
-
     const { stdout } = await execPromise(
-      `openssl x509 -text -noout -in ${tempFile}`
+      `echo "${certData}" | openssl x509 -text -noout`
     );
-    await fs.unlink(tempFile);
-
     return stdout;
   } catch (error) {
+    console.error("Certificate parsing error:", error);
     throw new Error(`Failed to parse certificate: ${error.message}`);
   }
 }
 
-function extractCertificateFields(clearTextCert) {
+async function extractCertificateFields(clearTextCert, identityHeader) {
   const fields = {
     signature: "",
     ani: "",
@@ -206,10 +317,25 @@ function extractCertificateFields(clearTextCert) {
   };
 
   try {
+    const { stdout } = await execPromise(
+      `/opt/stirshaken/scripts/parse_identity '${identityHeader}'`
+    );
+
+    const errorMatch = stdout.match(/\[errno: \d+\] ([^\n]+)/);
+    if (errorMatch) {
+      fields.Identity_error = errorMatch[1].trim();
+    }
+
+    const aniMatch = stdout.match(/"orig":\s*{\s*"tn":\s*"(\d+)"/);
+    fields.ani = aniMatch ? aniMatch[1] : "";
+
+    const dnisMatch = stdout.match(/"dest":\s*{\s*"tn":\s*\[\s*"(\d+)"/);
+    fields.dnis = dnisMatch ? dnisMatch[1] : "";
+
     const sigMatch = clearTextCert.match(/Signature Algorithm:\s*([\w-]+)/);
     fields.signature = sigMatch ? sigMatch[1] : "";
 
-    const caMatch = clearTextCert.match(/Issuer:.*?CN\s*=\s*([^,\n]+)/);
+    const caMatch = clearTextCert.match(/Issuer:.*?O\s*=\s*([^,\n]+)/);
     fields.CA = caMatch ? caMatch[1].trim() : "";
 
     const notBeforeMatch = clearTextCert.match(/Not Before:\s*([^G\n]+)/);
@@ -230,54 +356,28 @@ function extractCertificateFields(clearTextCert) {
     if (subjectMatch) {
       const subject = subjectMatch[1];
 
-      const ocnMatch = subject.match(/O\s*=\s*([^,/]+)/);
-      fields.OCN = ocnMatch ? ocnMatch[1].trim() : "";
+      const shakenMatch = subject.match(/CN=SHAKEN\s+(\w+)/);
+      fields.OCN = shakenMatch ? shakenMatch[1].trim() : "";
 
-      const countryMatch = subject.match(/C\s*=\s*([^,/]+)/);
+      const orgMatch = subject.match(/O\s*=\s*([^,]+)/);
+      fields.Origination = orgMatch ? orgMatch[1].trim() : "";
+
+      const countryMatch = subject.match(/C\s*=\s*([^,]+)/);
       fields.Country = countryMatch ? countryMatch[1].trim() : "";
     }
 
-    const shakenMatch = clearTextCert.match(/SHAKEN\s+(\w+)/);
-    if (shakenMatch) {
-      fields.ani = shakenMatch[1].trim();
-    }
-
-    const tnAuthMatch = clearTextCert.match(/TNAuthList:([^\n]+)/);
-    if (tnAuthMatch) {
-      fields.dnis = tnAuthMatch[1].trim();
-    }
-
-    fields.Origination = fields.OCN || "";
-
-    const errorMatches = clearTextCert.match(/ERROR:([^\n]+)/);
-    const criticalExtMatch = clearTextCert.match(
-      /Critical Extensions:([^\n]+)/
-    );
-
-    fields.Identity_error = errorMatches
-      ? errorMatches[1].trim()
-      : criticalExtMatch
-      ? criticalExtMatch[1].trim()
-      : "";
-
     return fields;
   } catch (error) {
-    logger(
-      "error",
-      "Certificate",
-      `Failed to extract certificate fields: ${error.message}`
-    );
     fields.Identity_error = error.message;
     return fields;
   }
 }
 
-async function checkIfRepeated(certUrl, currentUuid) {
+async function checkIfRepeated(certUrl) {
   const today = moment().startOf("day");
   const count = await Sti_Error.count({
     where: {
       cert_url: certUrl,
-      uuid: { [Op.ne]: currentUuid },
       createdAt: { [Op.gte]: today.toDate() },
     },
   });
@@ -300,37 +400,62 @@ app.post("/api/logs", async (req, res) => {
       uuid: logData.uuid || crypto.randomUUID(),
     }));
 
+    // Send immediate response
     res.json({
       success: true,
       uuids: processedErrors.map((error) => error.uuid),
       message: "Requests accepted for processing",
     });
 
-    // Process each error asynchronously
-    processedErrors.forEach((logData) => {
-      processCertificateData(logData).catch((error) => {
-        logger(
-          "error",
-          "Async Processing",
-          `Failed to process certificate ${logData.uuid}: ${error.message}`
-        );
-      });
+    // Process in background with proper error handling
+    Promise.all(
+      processedErrors.map(async (logData) => {
+        try {
+          await processCertificateData(logData);
+        } catch (error) {
+          logger(
+            "error",
+            "ProcessingError",
+            `Failed to process log ${logData.uuid}: ${error.message}`
+          );
+        }
+      })
+    ).catch((error) => {
+      logger(
+        "error",
+        "BatchProcessingError",
+        `Batch processing failed: ${error.message}`
+      );
     });
   } catch (error) {
-    logger("error", "API", `Error accepting request: ${error.message}`);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
 app.post("/api/notifications/opt-out", async (req, res) => {
-  const { email } = req.body;
+  const { email, company } = req.body;
 
   try {
-    await EmailPreference.upsert({
-      email,
-      opted_out: true,
-    });
-    logger("info", "Opt-out", `Email ${email} opted out of notifications`);
+    if (email) {
+      await EmailPreference.upsert({
+        email,
+        opted_out: true,
+      });
+      logger("info", "Opt-out", `Email ${email} opted out of notifications`);
+    }
+
+    if (company) {
+      await OptOutCompany.create({
+        company,
+        timestamp: new Date(),
+      });
+      logger(
+        "info",
+        "Opt-out",
+        `Company ${company} opted out of notifications`
+      );
+    }
+
     res.json({ success: true });
   } catch (error) {
     logger("error", "Opt-out", `Error processing opt-out: ${error.message}`);
@@ -340,11 +465,11 @@ app.post("/api/notifications/opt-out", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
-  logger("info", "Server", `Server is running on port ${PORT}`);
-});
-// sequelize.sync().then(() => {
-//   app.listen(PORT, () => {
-//     logger("info", "Server", `Server is running on port ${PORT}`);
-//   });
+// app.listen(PORT, () => {
+//   logger("info", "Server", `Server is running on port ${PORT}`);
 // });
+sequelize.sync().then(() => {
+  app.listen(PORT, () => {
+    logger("info", "Server", `Server is running on port ${PORT}`);
+  });
+});

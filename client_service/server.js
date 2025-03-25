@@ -17,7 +17,7 @@ function parseShakenErrorBlock(block) {
   if (!identityMatch) return null;
 
   const errors = lines
-    .slice(1)
+    .slice(2)
     .filter((line) => line.startsWith("[ERR"))
     .map((line) => {
       const match = line.match(/\[ERR \d+\] (.+)/);

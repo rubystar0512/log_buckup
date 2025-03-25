@@ -2,7 +2,14 @@ const winston = require("winston");
 const { createLogger, format, transports } = require("winston");
 const { combine, timestamp, printf } = format;
 const moment = require("moment");
+const fs = require("fs");
+const path = require("path");
 require("winston-daily-rotate-file");
+
+const logsDir = path.join(__dirname, "../logs");
+if (!fs.existsSync(logsDir)) {
+  fs.mkdirSync(logsDir, { recursive: true });
+}
 
 const baseLogger = createLogger({
   format: combine(
@@ -22,7 +29,7 @@ const baseLogger = createLogger({
       prettyPrint: true,
     }),
     new transports.DailyRotateFile({
-      filename: "logs/%DATE%.log",
+      filename: path.join(logsDir, "%DATE%.log"),
       datePattern: "YYYY-MM-DD",
       json: true,
       maxFiles: "30d",
